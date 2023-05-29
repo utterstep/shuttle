@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Path, State};
 use axum::handler::Handler;
 use axum::http::Request;
@@ -25,7 +26,7 @@ use shuttle_common::models::error::ErrorKind;
 use shuttle_common::models::{project, stats};
 use shuttle_common::request_span;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{broadcast, Mutex, MutexGuard};
 use tracing::{field, instrument, trace};
 use ttl_cache::TtlCache;
 
@@ -107,6 +108,37 @@ async fn get_project(
     };
 
     Ok(AxumJson(response))
+}
+
+#[instrument(skip(service))]
+#[utoipa::path(
+    get,
+    path = "/projects/websocket/{project_name}",
+    responses(
+        (status = 101),
+    ),
+    params(
+        ("project_name" = String, Path, description = "The name of the project."),
+    )
+)]
+async fn get_project_websocket(
+    State(RouterState {
+        service,
+        project_status,
+        ..
+    }): State<RouterState>,
+    ScopedUser { scope, .. }: ScopedUser,
+    ws: WebSocketUpgrade,
+) -> Result<Response, Error> {
+    Ok(ws.on_upgrade(move |mut ws: WebSocket| async move {
+        let mut receiver = project_status.subscribe();
+
+        while let Ok(status) = receiver.recv().await {
+            ws.send(Message::Text(
+                serde_json::to_string(&status).expect("Serialization failed"),
+            )).await.unwrap();
+        }
+    }))
 }
 
 #[utoipa::path(
@@ -657,6 +689,7 @@ pub(crate) struct RouterState {
     pub service: Arc<GatewayService>,
     pub sender: Sender<BoxedTask>,
     pub running_builds: Arc<Mutex<TtlCache<Uuid, ()>>>,
+    pub project_status: broadcast::Sender<Project>,
 }
 
 pub struct ApiBuilder {
@@ -765,6 +798,10 @@ impl ApiBuilder {
                 get(get_projects_list.layer(ScopedLayer::new(vec![Scope::Project]))),
             )
             .route(
+                "/projects/ws/:project_name",
+                get(get_project_websocket.layer(ScopedLayer::new(vec![Scope::Project]))),
+            )
+            .route(
                 "/projects/:project_name",
                 get(get_project.layer(ScopedLayer::new(vec![Scope::Project])))
                     .delete(destroy_project.layer(ScopedLayer::new(vec![Scope::ProjectCreate])))
@@ -805,11 +842,39 @@ impl ApiBuilder {
 
         let running_builds = Arc::new(Mutex::new(TtlCache::new(concurrent_builds)));
 
-        self.router.with_state(RouterState {
+        let (project_status, _) = broadcast::channel::<Project>(1);
+
+        let state = RouterState {
             service,
             sender,
             running_builds,
-        })
+            project_status: project_status.clone(),
+        };
+
+        tokio::task::spawn_blocking(move || {
+            loop {
+                let status = Project::Creating(ProjectCreating::new_with_random_initial_key(
+                    "my-project-test".parse().unwrap(), 
+                    0
+                ));
+                let _ = project_status.send(status);
+                std::thread::sleep(Duration::from_secs(3));
+                let status = Project::Creating(ProjectCreating::new_with_random_initial_key(
+                    "my-project-test2".parse().unwrap(), 
+                    0
+                ));
+                let _ = project_status.send(status);
+                std::thread::sleep(Duration::from_secs(3));
+                let status = Project::Creating(ProjectCreating::new_with_random_initial_key(
+                    "my-project-test3".parse().unwrap(), 
+                    0
+                ));
+                let _ = project_status.send(status);
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+
+        self.router.with_state(state.clone())
     }
 
     pub fn serve(self) -> impl Future<Output = Result<(), hyper::Error>> {

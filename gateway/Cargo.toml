@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 async-trait = { workspace = true }
-axum = { workspace = true, features = ["default", "headers"] }
+axum = { workspace = true, features = ["default", "headers", "ws"] }
 axum-server = { version = "0.4.4", features = ["tls-rustls"] }
 base64 = { workspace = true }
 bollard = "0.14.0"
